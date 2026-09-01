@@ -2184,6 +2184,485 @@ contract RitualPredictTest is Test {
             "both payouts arrived"
         );
     }
+    // ═══════════════════════════════════════════════════════════════════
+    //          MANY USERS AT ONCE, THE CLOCK, EMPTY WALLETS, LOAD
+    //
+    // There is no true concurrency inside a contract: the EVM orders every
+    // transaction in a block and runs them one at a time. The real
+    // questions behind "what if two people act at once" are therefore
+    //
+    //   * does the order they arrive in change anyone's money?
+    //   * can two actions that must not overlap land in the same block?
+    //
+    // Both are tested below, along with the wall clock (which this
+    // contract never reads), empty wallets on both sides, and what
+    // happens as the numbers get large.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── many people acting at once ─────────────────────────────────────
+
+    /// Pari-mutuel payouts are computed from the final pool totals, so the order the
+    /// bets arrived in cannot matter. Same four bets, two different orders, same money.
+    function test_Concurrency_PayoutsDependOnTotalsNotOnArrivalOrder() public {
+        uint256 snap = vm.snapshotState();
+
+        uint256 forwards = _create();
+        vm.prank(alice);
+        predict.bet{value: 3 ether}(forwards, true);
+        vm.prank(carol);
+        predict.bet{value: 2 ether}(forwards, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(forwards, false);
+        _rollToResolve(forwards);
+        _fire(forwards, 0);
+        vm.prank(alice);
+        predict.claimWinnings(forwards);
+        uint256 aliceForwards = alice.balance;
+        vm.prank(carol);
+        predict.claimWinnings(forwards);
+        uint256 carolForwards = carol.balance;
+
+        vm.revertToState(snap);
+
+        uint256 backwards = _create();
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(backwards, false);
+        vm.prank(carol);
+        predict.bet{value: 2 ether}(backwards, true);
+        vm.prank(alice);
+        predict.bet{value: 3 ether}(backwards, true);
+        _rollToResolve(backwards);
+        _fire(backwards, 0);
+        vm.prank(carol);
+        predict.claimWinnings(backwards); // and claimed in the opposite order too
+        vm.prank(alice);
+        predict.claimWinnings(backwards);
+
+        assertEq(alice.balance, aliceForwards, "alice is paid the same either way");
+        assertEq(carol.balance, carolForwards, "so is carol");
+    }
+
+    /// Twenty people bet without a single block passing between them.
+    function test_Concurrency_TwentyBetsInOneBlock() public {
+        uint256 id = _create();
+        uint256 startBlock = block.number;
+
+        for (uint256 i = 0; i < 20; i++) {
+            address p = address(uint160(0x200000 + i));
+            vm.deal(p, 1 ether);
+            vm.prank(p);
+            predict.bet{value: 1 ether}(id, i % 4 != 0); // 15 YES, 5 NO
+        }
+
+        assertEq(block.number, startBlock, "no block passed while they were betting");
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(m.totalYes, 15 ether);
+        assertEq(m.totalNo, 5 ether);
+
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 paid;
+        for (uint256 i = 0; i < 20; i++) {
+            address p = address(uint160(0x200000 + i));
+            if (i % 4 == 0) continue; // the losers get nothing
+            vm.prank(p);
+            predict.claimWinnings(id);
+            paid += p.balance;
+        }
+        assertLe(paid, 20 ether, "the pool is never overdrawn");
+        assertLt(address(predict).balance, 15, "under one wei per winner is left");
+    }
+
+    /// Two markets created without a block in between must not share anything.
+    function test_Concurrency_MarketsCreatedInOneBlockStaySeparate() public {
+        uint256 startBlock = block.number;
+        uint256 a = _create();
+        uint256 b = _create();
+        assertEq(block.number, startBlock, "same block");
+
+        assertTrue(a != b, "distinct market ids");
+        assertTrue(
+            _scheduleIdOf(a) != _scheduleIdOf(b),
+            "and distinct bookings with the Scheduler"
+        );
+
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(a, true);
+        assertEq(predict.getMarket(b).totalYes, 0, "a bet lands in one market only");
+    }
+
+    /// A late bet on the winning side dilutes everyone already there. That is what
+    /// pari-mutuel means, and it is worth stating rather than discovering.
+    function test_Concurrency_ALateBetDilutesTheBackersAlreadyOnThatSide() public {
+        uint256 snap = vm.snapshotState();
+
+        uint256 alone = _create();
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(alone, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(alone, false);
+        _rollToResolve(alone);
+        _fire(alone, 0);
+        vm.prank(alice);
+        predict.claimWinnings(alone);
+        uint256 payoutAlone = alice.balance - 99 ether; // she staked 1
+
+        vm.revertToState(snap);
+
+        uint256 crowded = _create();
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(crowded, true);
+        vm.prank(carol);
+        predict.bet{value: 9 ether}(crowded, true); // arrives just before the close
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(crowded, false);
+        _rollToResolve(crowded);
+        _fire(crowded, 0);
+        vm.prank(alice);
+        predict.claimWinnings(crowded);
+        uint256 payoutCrowded = alice.balance - 99 ether;
+
+        assertEq(payoutAlone, 2 ether, "alone she takes the whole pool");
+        assertEq(payoutCrowded, 1.1 ether, "sharing with carol she takes a tenth of it");
+        assertLt(payoutCrowded, payoutAlone, "a late backer dilutes the earlier ones");
+    }
+
+    /// Betting and resolving must never be able to land in the same block, whatever
+    /// durations the creator asks for.
+    function testFuzz_ResolutionIsAlwaysAfterTheCloseBlock(
+        uint32 bettingSeconds,
+        uint32 delaySeconds
+    ) public {
+        uint256 betting = bound(
+            uint256(bettingSeconds),
+            predict.MIN_BETTING_SECONDS(),
+            predict.MAX_MARKET_SECONDS() - predict.MIN_RESOLVE_DELAY_SECONDS()
+        );
+        uint256 delay = bound(
+            uint256(delaySeconds),
+            predict.MIN_RESOLVE_DELAY_SECONDS(),
+            predict.MAX_MARKET_SECONDS() - betting
+        );
+
+        RitualPredict.NewMarket memory p = _params();
+        p.bettingSeconds = betting;
+        p.resolveDelaySeconds = delay;
+
+        RitualPredict.Market memory m = predict.getMarket(predict.createMarket(p));
+        assertGt(m.closeBlock, block.number, "betting is open for at least one block");
+        assertGt(
+            m.resolveBlock,
+            m.closeBlock,
+            "and resolution is always at least one block later"
+        );
+    }
+
+    // ── the wall clock ─────────────────────────────────────────────────
+
+    /// Runs an identical market from an identical starting state at a given wall-clock
+    /// time, and hands back the finished market for comparison.
+    function _lifecycleAtTimestamp(
+        uint256 timestampMs
+    ) internal returns (RitualPredict.Market memory m) {
+        uint256 snap = vm.snapshotState();
+        vm.warp(timestampMs);
+
+        uint256 id = _armedMarket();
+        _fire(id, 0);
+        m = predict.getMarket(id);
+
+        vm.revertToState(snap);
+    }
+
+    /// The contract contains no reference to `block.timestamp` at all: deadlines are
+    /// block numbers, and the constructor converts human seconds into blocks once. So
+    /// there is no calendar arithmetic anywhere, and nothing for a leap day, a leap
+    /// second or a timezone to break. Rather than skip the question, this runs the same
+    /// market on a leap day, on the 2100 boundary (a year divisible by 100 but not 400,
+    /// the classic off-by-one in date code) and far in the future, and shows that every
+    /// field of the result is byte-for-byte the same.
+    ///
+    /// Timestamps are in milliseconds because that is what Ritual Chain reports.
+    function test_Clock_TheWallClockCannotChangeAnything() public {
+        RitualPredict.Market memory leapDay = _lifecycleAtTimestamp(
+            1_835_395_200_000 // 2028-02-29
+        );
+        RitualPredict.Market memory notALeapYear = _lifecycleAtTimestamp(
+            4_108_233_600_000 // 2100-03-01
+        );
+        RitualPredict.Market memory farFuture = _lifecycleAtTimestamp(
+            253_402_300_799_000 // 9999-12-31
+        );
+
+        assertEq(leapDay.closeBlock, notALeapYear.closeBlock, "same close block");
+        assertEq(leapDay.closeBlock, farFuture.closeBlock);
+        assertEq(leapDay.resolveBlock, notALeapYear.resolveBlock, "same resolve block");
+        assertEq(leapDay.resolveBlock, farFuture.resolveBlock);
+        assertEq(uint256(leapDay.state), uint256(notALeapYear.state), "same state");
+        assertEq(uint256(leapDay.state), uint256(farFuture.state));
+        assertEq(uint256(leapDay.outcome), uint256(notALeapYear.outcome), "same outcome");
+        assertEq(uint256(leapDay.outcome), uint256(farFuture.outcome));
+        assertEq(leapDay.observedValue, notALeapYear.observedValue);
+        assertEq(leapDay.observedValue, farFuture.observedValue);
+        assertEq(leapDay.attempts, notALeapYear.attempts);
+        assertEq(leapDay.attempts, farFuture.attempts);
+    }
+
+    /// The deadline is a block number, so a clock that jumps does not move it either.
+    function test_Clock_ASuddenJumpDoesNotCloseOrOpenAMarket() public {
+        uint256 id = _openMarket();
+
+        vm.warp(block.timestamp + 3650 days); // ten years pass on the clock
+        _assertState(
+            id,
+            RitualPredict.MarketState.Open,
+            "betting is still open: no block was mined"
+        );
+
+        vm.prank(carol);
+        predict.bet{value: 1 ether}(id, true); // and still accepted
+
+        vm.roll(predict.getMarket(id).closeBlock); // one block does what a decade did not
+        _assertState(id, RitualPredict.MarketState.Closed, "blocks are the only clock");
+    }
+
+    // ── empty wallets, on both sides ───────────────────────────────────
+
+    /// `vm.prank` only changes who the sender *appears* to be; the ether still comes
+    /// out of the test contract's own balance. To test a genuinely empty wallet the
+    /// bettor has to be a real account with a real balance, so this one is a contract.
+    function test_Funds_ABettorWithoutTheMoneyCannotBet() public {
+        uint256 id = _create();
+
+        BrokeBettor broke = new BrokeBettor(predict);
+        vm.deal(address(broke), 0.5 ether); // wants to stake 1 ether, holds half
+
+        vm.expectRevert();
+        broke.tryBet(id, 1 ether);
+        assertEq(predict.getMarket(id).totalYes, 0, "nothing was recorded");
+
+        broke.tryBet(id, 0.5 ether); // exactly what it holds does go through
+        assertEq(predict.getMarket(id).totalYes, 0.5 ether, "spending it all is fine");
+        assertEq(address(broke).balance, 0, "and leaves the wallet empty");
+
+        vm.expectRevert();
+        broke.tryBet(id, 1 wei); // now even one wei is out of reach
+    }
+
+    /// The contract prepays its own scheduled executions out of its RitualWallet
+    /// balance. Nothing stops a market being created while that balance is zero: the
+    /// booking is made, but on a real chain the Scheduler skips an execution it cannot
+    /// charge for. This pins the behaviour so it is a known operating requirement
+    /// rather than a surprise.
+    function test_Funds_AMarketIsBookedEvenWithNoPrepaidBalance() public {
+        assertEq(predict.executionBalance(), 0, "nothing prepaid yet");
+
+        uint256 id = _create();
+        assertTrue(_scheduleIdOf(id) != 0, "the booking is made regardless");
+
+        predict.fundExecution{value: 1 ether}(1000);
+        assertEq(
+            predict.executionBalance(),
+            1 ether,
+            "funding it afterwards still works"
+        );
+    }
+
+    /// After a market resolves, the contract must be holding exactly what it still owes.
+    function test_Funds_TheContractHoldsExactlyWhatItStillOwes() public {
+        uint256 id = _create();
+        vm.prank(alice);
+        predict.bet{value: 3 ether}(id, true);
+        vm.prank(carol);
+        predict.bet{value: 2 ether}(id, true);
+        vm.prank(bob);
+        predict.bet{value: 5 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        (, , , uint256 aliceOwed) = predict.stakesOf(id, alice);
+        (, , , uint256 carolOwed) = predict.stakesOf(id, carol);
+        (, , , uint256 bobOwed) = predict.stakesOf(id, bob);
+        assertEq(bobOwed, 0, "the losing side is owed nothing");
+        assertGe(
+            address(predict).balance,
+            aliceOwed + carolOwed,
+            "the balance covers every outstanding claim"
+        );
+
+        vm.prank(alice);
+        predict.claimWinnings(id);
+        (, , , uint256 carolStillOwed) = predict.stakesOf(id, carol);
+        assertGe(
+            address(predict).balance,
+            carolStillOwed,
+            "and still covers the rest afterwards"
+        );
+    }
+
+    // ── load: what happens as the numbers grow ─────────────────────────
+
+    /// The Scheduler is told to allow RESOLVE_GAS_LIMIT gas per execution. If the
+    /// callback does not fit inside that, every resolution on a real chain fails.
+    function test_Load_ResolutionFitsInsideTheBookedGasLimit() public {
+        uint256 id = _armedMarket();
+
+        uint256 before = gasleft();
+        _fire(id, 0);
+        uint256 used = before - gasleft();
+
+        _assertState(id, RitualPredict.MarketState.Resolved, "it did resolve");
+        assertLt(
+            used,
+            predict.RESOLVE_GAS_LIMIT(),
+            "a resolution must fit in the gas the contract books for it"
+        );
+        // Comfortably inside, not just barely: the mocks are cheaper than the real
+        // precompiles, so the margin has to be wide. Measured at ~223k gas here,
+        // roughly a ninth of the 2,000,000 booked.
+        assertLt(used, predict.RESOLVE_GAS_LIMIT() / 4, "with room to spare");
+    }
+
+    /// Nothing in `bet` loops over participants, so the two-hundredth bettor pays what
+    /// the second one paid.
+    function test_Load_BettingCostDoesNotGrowWithTheCrowd() public {
+        uint256 id = _create();
+
+        address second = address(uint160(0x300000));
+        vm.deal(second, 1 ether);
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(id, true); // the first bet also opens the pool
+        uint256 g0 = gasleft();
+        vm.prank(second);
+        predict.bet{value: 1 ether}(id, true);
+        uint256 earlyCost = g0 - gasleft();
+
+        for (uint256 i = 1; i < 198; i++) {
+            address p = address(uint160(0x300000 + i));
+            vm.deal(p, 1 ether);
+            vm.prank(p);
+            predict.bet{value: 1 ether}(id, true);
+        }
+
+        address last = address(uint160(0x300000 + 198));
+        vm.deal(last, 1 ether);
+        uint256 g1 = gasleft();
+        vm.prank(last);
+        predict.bet{value: 1 ether}(id, true);
+        uint256 lateCost = g1 - gasleft();
+
+        assertLe(
+            lateCost,
+            (earlyCost * 11) / 10,
+            "the 200th bet costs what the 2nd did, within 10%"
+        );
+    }
+
+    /// Payouts are pull-based: each winner pays for their own claim, and that cost does
+    /// not depend on how many other winners there are.
+    function test_Load_ClaimCostDoesNotGrowWithTheNumberOfWinners() public {
+        uint256 id = _create();
+        uint256 n = 100;
+
+        for (uint256 i = 0; i < n; i++) {
+            address p = address(uint160(0x400000 + i));
+            vm.deal(p, 1 ether);
+            vm.prank(p);
+            predict.bet{value: 1 ether}(id, true);
+        }
+        vm.prank(bob);
+        predict.bet{value: 3 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0);
+
+        uint256 g0 = gasleft();
+        vm.prank(address(uint160(0x400000)));
+        predict.claimWinnings(id);
+        uint256 firstCost = g0 - gasleft();
+
+        for (uint256 i = 1; i < n - 1; i++) {
+            vm.prank(address(uint160(0x400000 + i)));
+            predict.claimWinnings(id);
+        }
+
+        uint256 g1 = gasleft();
+        vm.prank(address(uint160(0x400000 + n - 1)));
+        predict.claimWinnings(id);
+        uint256 lastCost = g1 - gasleft();
+
+        assertLe(
+            lastCost,
+            (firstCost * 12) / 10,
+            "the hundredth winner pays what the first one paid, within 20%"
+        );
+    }
+
+    /// `getMarkets()` is the only loop in the contract and it walks every market ever
+    /// created. That is fine for a workshop and it is a hard ceiling for anything
+    /// bigger, so the growth is measured rather than assumed.
+    function test_Load_GetMarketsCostGrowsWithEveryMarketEverCreated() public {
+        for (uint256 i = 0; i < 10; i++) _create();
+        uint256 g0 = gasleft();
+        predict.getMarkets();
+        uint256 costAtTen = g0 - gasleft();
+
+        for (uint256 i = 0; i < 50; i++) _create();
+        uint256 g1 = gasleft();
+        RitualPredict.Market[] memory all = predict.getMarkets();
+        uint256 costAtSixty = g1 - gasleft();
+
+        assertEq(all.length, 60, "every market comes back in one array");
+        assertGt(
+            costAtSixty,
+            costAtTen * 4,
+            "the cost is proportional to the number of markets, not constant"
+        );
+
+        // The marginal cost of one more market, used to state the practical ceiling.
+        // Measured: ~384k gas at 10 markets, ~2.33M at 60, so roughly 39k per market.
+        // An eth_call is not bound by the block gas limit, but a node's RPC cap is
+        // typically 50M, which puts the practical ceiling near 1,200 markets.
+        uint256 perMarket = (costAtSixty - costAtTen) / 50;
+        assertGt(perMarket, 0);
+        assertLt(perMarket, 100_000, "under 100k gas per market in the list");
+    }
+
+    /// A market that is heavily used in every dimension at once still settles.
+    function test_Load_ABusyMarketStillResolvesAndPaysOut() public {
+        uint256 id = _create();
+        uint256 n = 150;
+        uint256 stakedYes;
+
+        for (uint256 i = 0; i < n; i++) {
+            address p = address(uint160(0x500000 + i));
+            uint256 stake = 1 ether + (i * 137 gwei); // deliberately uneven
+            vm.deal(p, stake);
+            vm.prank(p);
+            predict.bet{value: stake}(id, true);
+            stakedYes += stake;
+        }
+        vm.prank(bob);
+        predict.bet{value: 7 ether}(id, false);
+
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 pool = stakedYes + 7 ether;
+        assertEq(address(predict).balance, pool);
+
+        uint256 paid;
+        for (uint256 i = 0; i < n; i++) {
+            address p = address(uint160(0x500000 + i));
+            vm.prank(p);
+            predict.claimWinnings(id);
+            paid += p.balance;
+        }
+
+        assertLe(paid, pool, "150 uneven winners never overdraw the pool");
+        assertEq(address(predict).balance, pool - paid);
+        assertLt(address(predict).balance, n, "under one wei of dust per winner");
+    }
 }
 
 // ───────────────────────── test-only counterparties ──────────────────────────
@@ -2262,5 +2741,17 @@ contract PickyReceiver {
 
     receive() external payable {
         require(accepting, "not accepting right now");
+    }
+}
+
+contract BrokeBettor {
+    RitualPredict public predict;
+
+    constructor(RitualPredict p) {
+        predict = p;
+    }
+
+    function tryBet(uint256 marketId, uint256 amount) external {
+        predict.bet{value: amount}(marketId, true);
     }
 }
