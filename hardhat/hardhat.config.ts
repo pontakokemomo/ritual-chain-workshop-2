@@ -40,6 +40,13 @@ export default defineConfig({
       type: "edr-simulated",
       chainType: "l1",
     },
+    // A real node started with `npx hardhat node`. The end-to-end tests can be
+    // pointed at it with:  E2E_NETWORK=localhost npx hardhat test nodejs
+    localhost: {
+      type: "http",
+      chainType: "l1",
+      url: process.env.LOCALHOST_RPC_URL ?? "http://127.0.0.1:8545",
+    },
     // Ritual Chain testnet. Requires EIP-1559 (type-2) transactions; viem sends
     // those by default.
     ritual: {

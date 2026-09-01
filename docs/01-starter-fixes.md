@@ -79,10 +79,19 @@ committed. These are the gaps this fork sets out to fill:
 
 | Referenced by | Path | Status |
 | --- | --- | --- |
-| `hardhat/README.md` | `contracts/RitualPredict.t.sol` (33 Solidity tests) | absent |
-| `hardhat/README.md` | `contracts/mocks/RitualMocks.sol` | absent |
-| `hardhat/README.md` | `test/RitualPredict.e2e.ts` (2 TypeScript tests) | absent |
-| `scripts/deploy.ts:92`, `scripts/export-abi.ts:12`, `scripts/market-presets.ts:17` | `web/` frontend | absent |
+| `hardhat/README.md` | `contracts/RitualPredict.t.sol` (33 Solidity tests) | written, 132 tests |
+| `hardhat/README.md` | `contracts/mocks/RitualMocks.sol` | written |
+| `hardhat/README.md` | `test/RitualPredict.e2e.ts` (2 TypeScript tests) | written, 3 tests |
+| `scripts/deploy.ts:92`, `scripts/export-abi.ts:12`, `scripts/market-presets.ts:17` | `web/` frontend | still absent |
+
+The README's own counts were stale as well (they described files that were never
+committed), so they now state what the suite actually contains.
+
+Two loose ends are deliberately left alone. The `web/` frontend is out of scope for
+the workshop deliverable. And `npx tsc --noEmit` reports `TS5097` on the seven
+upstream `scripts/*.ts` imports: Hardhat 3 runs TypeScript through Node's type
+stripping, which requires the `.ts` extension in import paths, but `tsconfig.json`
+does not set `allowImportingTsExtensions`. The contracts and tests typecheck clean.
 
 `contracts/RitualPredict.sol` also carries five unimplemented bodies marked
 `// we'll fill this up`, at lines 208, 240, 380, 423 and 432:
