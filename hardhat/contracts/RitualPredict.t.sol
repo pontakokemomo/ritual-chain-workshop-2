@@ -958,4 +958,911 @@ contract RitualPredictTest is Test {
             "the Scheduler must be allowed to draw fees and call back"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //                          BOUNDARY VALUES
+    //
+    // Every limit in the contract, exercised at the value itself and at one
+    // step either side of it: the comparison against the target, stake
+    // sizes, participant counts, durations, block deadlines and the
+    // attempt counter.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Teach the oracle mocks to report one specific number.
+    function _setObserved(uint256 observed) internal {
+        string memory json = string.concat(
+            '{"ethereum":{"usd":',
+            vm.toString(observed),
+            "}}"
+        );
+        http.setResponse(200, bytes(json), "");
+        jq.setResult(JSON_PATH, json, observed);
+    }
+
+    function _outcomeFor(
+        uint256 target,
+        RitualPredict.Comparator c,
+        uint256 observed
+    ) internal returns (RitualPredict.Outcome) {
+        _setObserved(observed);
+
+        RitualPredict.NewMarket memory p = _params();
+        p.target = target;
+        p.comparator = c;
+        uint256 id = predict.createMarket(p);
+
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(id, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0);
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(m.observedValue, observed);
+        return m.outcome;
+    }
+
+    function _assertYes(RitualPredict.Outcome o, string memory why) internal pure {
+        assertEq(uint256(o), uint256(RitualPredict.Outcome.Yes), why);
+    }
+
+    function _assertNo(RitualPredict.Outcome o, string memory why) internal pure {
+        assertEq(uint256(o), uint256(RitualPredict.Outcome.No), why);
+    }
+
+    // ── the comparison itself: observed exactly on the target ──────────
+
+    function test_Boundary_ObservedEqualsTarget_GT_IsNo() public {
+        _assertNo(
+            _outcomeFor(TARGET, RitualPredict.Comparator.GT, TARGET),
+            "equal is not strictly greater"
+        );
+    }
+
+    function test_Boundary_ObservedEqualsTarget_GTE_IsYes() public {
+        _assertYes(
+            _outcomeFor(TARGET, RitualPredict.Comparator.GTE, TARGET),
+            "equal satisfies at-least"
+        );
+    }
+
+    function test_Boundary_ObservedEqualsTarget_LT_IsNo() public {
+        _assertNo(
+            _outcomeFor(TARGET, RitualPredict.Comparator.LT, TARGET),
+            "equal is not strictly less"
+        );
+    }
+
+    function test_Boundary_ObservedEqualsTarget_LTE_IsYes() public {
+        _assertYes(
+            _outcomeFor(TARGET, RitualPredict.Comparator.LTE, TARGET),
+            "equal satisfies at-most"
+        );
+    }
+
+    function test_Boundary_ObservedOneBelowTarget_GTE_IsNo() public {
+        _assertNo(
+            _outcomeFor(TARGET, RitualPredict.Comparator.GTE, TARGET - 1),
+            "one short of the target must not pay YES"
+        );
+    }
+
+    function test_Boundary_ObservedOneAboveTarget_GT_IsYes() public {
+        _assertYes(
+            _outcomeFor(TARGET, RitualPredict.Comparator.GT, TARGET + 1),
+            "one over the target is enough"
+        );
+    }
+
+    function test_Boundary_ObservedOneAboveTarget_LTE_IsNo() public {
+        _assertNo(
+            _outcomeFor(TARGET, RitualPredict.Comparator.LTE, TARGET + 1),
+            "one over the target breaks at-most"
+        );
+    }
+
+    // ── the ends of the uint256 range ──────────────────────────────────
+
+    function test_Boundary_ZeroTargetAndZeroObserved() public {
+        _assertYes(
+            _outcomeFor(0, RitualPredict.Comparator.GTE, 0),
+            "0 >= 0"
+        );
+        _assertNo(_outcomeFor(0, RitualPredict.Comparator.GT, 0), "0 > 0 is false");
+    }
+
+    function test_Boundary_ZeroTargetIsAlwaysMetByGte() public {
+        _assertYes(
+            _outcomeFor(0, RitualPredict.Comparator.GTE, type(uint256).max),
+            "everything is at least zero"
+        );
+    }
+
+    function test_Boundary_MaxUintTarget() public {
+        _assertYes(
+            _outcomeFor(
+                type(uint256).max,
+                RitualPredict.Comparator.GTE,
+                type(uint256).max
+            ),
+            "max >= max"
+        );
+        _assertNo(
+            _outcomeFor(
+                type(uint256).max,
+                RitualPredict.Comparator.GT,
+                type(uint256).max
+            ),
+            "nothing exceeds the maximum"
+        );
+    }
+
+    // ── stake size: the smallest and largest amounts ───────────────────
+
+    function test_Boundary_OneWeiOnEachSideStillPaysOut() public {
+        uint256 id = _create();
+
+        vm.prank(alice);
+        predict.bet{value: 1 wei}(id, true);
+        vm.prank(bob);
+        predict.bet{value: 1 wei}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        assertEq(alice.balance - before, 2 wei, "the whole pool, two wei");
+        assertEq(address(predict).balance, 0);
+    }
+
+    /// The pool would have to be larger than every token that will ever exist for
+    /// `stake * pool` to overflow, but the ceiling is worth pinning down.
+    function test_Boundary_AstronomicalStakesStillPayOut() public {
+        uint256 huge = 2 ** 120; // ~1.3e36 wei, ten orders of magnitude past any supply
+        uint256 id = _create();
+
+        vm.deal(alice, huge);
+        vm.prank(alice);
+        predict.bet{value: huge}(id, true);
+        vm.deal(bob, huge);
+        vm.prank(bob);
+        predict.bet{value: huge}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        assertEq(alice.balance, 2 * huge, "the winner takes both sides");
+        assertEq(address(predict).balance, 0);
+    }
+
+    /// Integer division keeps sub-wei remainders in the contract. That is deliberate,
+    /// and this pins the size of it: strictly less than one wei per winner.
+    function test_Boundary_DustFromIntegerDivisionStaysBehind() public {
+        uint256 id = _create();
+
+        address[3] memory winners = [alice, carol, address(0xDEAD01)];
+        for (uint256 i = 0; i < winners.length; i++) {
+            vm.deal(winners[i], 1 ether);
+            vm.prank(winners[i]);
+            predict.bet{value: 1 wei}(id, true);
+        }
+        vm.prank(bob);
+        predict.bet{value: 1 wei}(id, false);
+
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 paid;
+        for (uint256 i = 0; i < winners.length; i++) {
+            uint256 before = winners[i].balance;
+            vm.prank(winners[i]);
+            predict.claimWinnings(id);
+            paid += winners[i].balance - before;
+        }
+
+        // pool = 4 wei, winning side = 3 wei, each winner gets 4/3 = 1 wei.
+        assertEq(paid, 3 wei);
+        assertEq(address(predict).balance, 1 wei, "one wei of dust is left");
+        assertLt(
+            address(predict).balance,
+            winners.length,
+            "dust is always under one wei per winner"
+        );
+    }
+
+    // ── participant count: none, one, many ─────────────────────────────
+
+    function test_Boundary_MarketWithNoBetsAtAllBecomesInvalid() public {
+        uint256 id = _create();
+        _rollToResolve(id);
+        _fire(id, 0);
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(uint256(m.state), uint256(RitualPredict.MarketState.Invalid));
+        assertEq(m.invalidReason, "no stake on the winning side");
+        assertEq(address(predict).balance, 0);
+    }
+
+    function test_Boundary_SingleParticipantOnTheWinningSideTakesEverything()
+        public
+    {
+        uint256 id = _create();
+
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(id, true);
+        vm.prank(bob);
+        predict.bet{value: 9 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        assertEq(alice.balance - before, 10 ether, "the lone winner takes the pool");
+    }
+
+    /// Everyone on one side, and that side wins: each participant gets exactly their
+    /// own stake back, because the pool and the winning pool are the same number.
+    function test_Boundary_EveryoneOnTheWinningSideGetsTheirStakeBack() public {
+        uint256 id = _create();
+
+        vm.prank(alice);
+        predict.bet{value: 3 ether}(id, true);
+        vm.prank(carol);
+        predict.bet{value: 7 ether}(id, true);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 aliceBefore = alice.balance;
+        vm.prank(alice);
+        predict.claimWinnings(id);
+        assertEq(alice.balance - aliceBefore, 3 ether);
+
+        uint256 carolBefore = carol.balance;
+        vm.prank(carol);
+        predict.claimWinnings(id);
+        assertEq(carol.balance - carolBefore, 7 ether);
+
+        assertEq(address(predict).balance, 0);
+    }
+
+    function test_Boundary_FiftyWinnersCanAllClaim() public {
+        uint256 id = _create();
+        uint256 n = 50;
+
+        for (uint256 i = 0; i < n; i++) {
+            address p = address(uint160(0x100000 + i));
+            vm.deal(p, 1 ether);
+            vm.prank(p);
+            predict.bet{value: 1 ether}(id, true);
+        }
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 pool = (n + 1) * 1 ether;
+        assertEq(address(predict).balance, pool);
+
+        uint256 paid;
+        for (uint256 i = 0; i < n; i++) {
+            address p = address(uint160(0x100000 + i));
+            vm.prank(p);
+            predict.claimWinnings(id);
+            paid += p.balance;
+        }
+
+        assertLe(paid, pool, "payouts can never exceed the pool");
+        assertEq(address(predict).balance, pool - paid);
+        assertLt(address(predict).balance, n, "under one wei of dust per winner");
+    }
+
+    // ── durations: exactly at the minimum and the maximum ──────────────
+
+    function test_Boundary_MinimumBettingWindowIsAccepted() public {
+        RitualPredict.NewMarket memory p = _params();
+        p.bettingSeconds = predict.MIN_BETTING_SECONDS();
+        assertEq(predict.createMarket(p), 1);
+    }
+
+    function test_Boundary_MinimumResolveDelayIsAccepted() public {
+        RitualPredict.NewMarket memory p = _params();
+        p.resolveDelaySeconds = predict.MIN_RESOLVE_DELAY_SECONDS();
+        assertEq(predict.createMarket(p), 1);
+    }
+
+    function test_Boundary_ExactlyTheMaximumMarketLengthIsAccepted() public {
+        RitualPredict.NewMarket memory p = _params();
+        p.resolveDelaySeconds = predict.MIN_RESOLVE_DELAY_SECONDS();
+        p.bettingSeconds =
+            predict.MAX_MARKET_SECONDS() -
+            p.resolveDelaySeconds;
+
+        uint256 id = predict.createMarket(p);
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertGt(m.resolveBlock, m.closeBlock);
+    }
+
+    function test_Boundary_OneSecondOverTheMaximumReverts() public {
+        RitualPredict.NewMarket memory p = _params();
+        p.resolveDelaySeconds = predict.MIN_RESOLVE_DELAY_SECONDS();
+        p.bettingSeconds =
+            predict.MAX_MARKET_SECONDS() -
+            p.resolveDelaySeconds +
+            1;
+
+        vm.expectRevert(RitualPredict.BadDuration.selector);
+        predict.createMarket(p);
+    }
+
+    /// A chain slow enough that the whole window rounds to zero blocks still has to
+    /// produce a usable market: `_secondsToBlocks` clamps to one block.
+    function test_Boundary_VerySlowChainClampsToOneBlock() public {
+        RitualPredict predictSlow = new RitualPredict(1_000_000_000); // 1000 s/block
+        uint256 start = block.number;
+
+        uint256 id = predictSlow.createMarket(_params());
+        RitualPredict.Market memory m = predictSlow.getMarket(id);
+
+        assertEq(m.closeBlock, start + 1);
+        assertEq(m.resolveBlock, start + 2);
+    }
+
+    function test_Boundary_VeryFastChainProducesLargeBlockCounts() public {
+        RitualPredict predictFast = new RitualPredict(1); // 1 ms/block
+        uint256 start = block.number;
+
+        uint256 id = predictFast.createMarket(_params());
+        RitualPredict.Market memory m = predictFast.getMarket(id);
+
+        assertEq(m.closeBlock, start + BETTING_SECONDS * 1000);
+        assertEq(
+            m.resolveBlock,
+            m.closeBlock + RESOLVE_DELAY_SECONDS * 1000
+        );
+    }
+
+    // ── block deadlines: the last block that still works ───────────────
+
+    function test_Boundary_BetSucceedsOnTheBlockBeforeClose() public {
+        uint256 id = _create();
+        vm.roll(predict.getMarket(id).closeBlock - 1);
+
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(id, true);
+        assertEq(predict.getMarket(id).totalYes, 1 ether);
+    }
+
+    function test_Boundary_ResolveRunsOnTheResolveBlockItself() public {
+        uint256 id = _armedMarket(); // rolls to exactly resolveBlock
+        assertEq(block.number, predict.getMarket(id).resolveBlock);
+
+        _fire(id, 0);
+        assertEq(
+            uint256(_state(id)),
+            uint256(RitualPredict.MarketState.Resolved)
+        );
+    }
+
+    function test_Boundary_ResolveIsIgnoredOneBlockEarly() public {
+        uint256 id = _create();
+        vm.roll(predict.getMarket(id).resolveBlock - 1);
+
+        _fire(id, 0);
+        assertEq(predict.getMarket(id).attempts, 0);
+    }
+
+    // ── the attempt counter: the last chance ───────────────────────────
+
+    function test_Boundary_ThirdAttemptCanStillResolveTheMarket() public {
+        uint256 id = _armedMarket();
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+
+        _fire(id, 0);
+        _fire(id, 1);
+        http.setResponse(200, bytes(ORACLE_JSON), ""); // back just in time
+        _fire(id, 2);
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(m.attempts, predict.MAX_ATTEMPTS());
+        assertEq(uint256(m.state), uint256(RitualPredict.MarketState.Resolved));
+        assertEq(uint256(m.outcome), uint256(RitualPredict.Outcome.Yes));
+    }
+
+    // ── property-based sweeps over the whole stake range ───────────────
+
+    /// Whatever the three stakes are, the winners between them can never draw more than
+    /// the pool, and what stays behind is under one wei per winner.
+    function testFuzz_PayoutsNeverExceedThePool(
+        uint96 yesA,
+        uint96 yesB,
+        uint96 noC
+    ) public {
+        uint256 a = bound(uint256(yesA), 1, 1e28);
+        uint256 b = bound(uint256(yesB), 1, 1e28);
+        uint256 c = bound(uint256(noC), 1, 1e28);
+
+        uint256 id = _create();
+        vm.deal(alice, a);
+        vm.prank(alice);
+        predict.bet{value: a}(id, true);
+        vm.deal(carol, b);
+        vm.prank(carol);
+        predict.bet{value: b}(id, true);
+        vm.deal(bob, c);
+        vm.prank(bob);
+        predict.bet{value: c}(id, false);
+
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        uint256 pool = a + b + c;
+        assertEq(address(predict).balance, pool);
+
+        vm.prank(alice);
+        predict.claimWinnings(id);
+        vm.prank(carol);
+        predict.claimWinnings(id);
+
+        uint256 left = address(predict).balance;
+        assertLt(left, 2, "at most one wei of dust per winner stays behind");
+        assertEq(alice.balance + carol.balance, pool - left);
+    }
+
+    function testFuzz_RefundsReturnExactlyWhatWasStaked(
+        uint96 yesA,
+        uint96 noB
+    ) public {
+        uint256 a = bound(uint256(yesA), 1, 1e28);
+        uint256 b = bound(uint256(noB), 1, 1e28);
+
+        uint256 id = _create();
+        vm.deal(alice, a);
+        vm.prank(alice);
+        predict.bet{value: a}(id, true);
+        vm.deal(bob, b);
+        vm.prank(bob);
+        predict.bet{value: b}(id, false);
+
+        _rollToResolve(id);
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+        _fire(id, 0);
+        _fire(id, 1);
+        _fire(id, 2);
+
+        vm.prank(alice);
+        predict.claimRefund(id);
+        vm.prank(bob);
+        predict.claimRefund(id);
+
+        assertEq(alice.balance, a);
+        assertEq(bob.balance, b);
+        assertEq(address(predict).balance, 0, "a refund leaves nothing behind");
+    }
+
+    /// Any observed value at or above the target is YES, anything below it is NO. This
+    /// sweeps the whole comparison rather than the handful of points above.
+    function testFuzz_GteMatchesTheTargetExactly(uint256 observed) public {
+        RitualPredict.Outcome o = _outcomeFor(
+            TARGET,
+            RitualPredict.Comparator.GTE,
+            observed
+        );
+        if (observed >= TARGET) {
+            _assertYes(o, "at or above the target is YES");
+        } else {
+            _assertNo(o, "below the target is NO");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //                        STATE TRANSITIONS
+    //
+    // A market is a five-state machine. `Closed` is the odd one out: no
+    // transaction exists to flip Open -> Closed, so `getMarket` derives it
+    // from the block number and it is never written to storage.
+    //
+    //        createMarket
+    //             |
+    //             v
+    //          [Open] --- block >= closeBlock (derived, no tx) --> [Closed]
+    //                                                                  |
+    //                                        block >= resolveBlock,    |
+    //                                        the Scheduler fires ------+
+    //                                                                  v
+    //                          read failed (attempt < 3) --> [Resolving] --+
+    //                                                 ^                    |
+    //                                                 +--------------------+
+    //                                                        retry
+    //                          read ok, winners exist --> [Resolved]  (terminal)
+    //                          3 failed reads, or nobody
+    //                          on the winning side     --> [Invalid]   (terminal)
+    //
+    // Valid events per state; everything else must revert or be ignored:
+    //
+    //   state      bet             claimWinnings  claimRefund   Scheduler fire
+    //   -----------------------------------------------------------------------
+    //   Open       accepted        NotResolved    NotInvalid    ignored (early)
+    //   Closed     BettingClosed   NotResolved    NotInvalid    resolves
+    //   Resolving  BettingClosed   NotResolved    NotInvalid    retries
+    //   Resolved   BettingClosed   pays once      NotInvalid    ignored
+    //   Invalid    BettingClosed   NotResolved    refunds once  ignored
+    //
+    // The tests below walk every valid path, then sweep the whole invalid
+    // half of that table, then prove both terminal states are terminal.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── a market parked in each state ──────────────────────────────────
+
+    function _openMarket() internal returns (uint256 id) {
+        id = _create();
+        vm.prank(alice);
+        predict.bet{value: 3 ether}(id, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+    }
+
+    function _closedMarket() internal returns (uint256 id) {
+        id = _openMarket();
+        vm.roll(predict.getMarket(id).closeBlock); // betting over, resolution not due
+    }
+
+    function _resolvingMarket() internal returns (uint256 id) {
+        id = _armedMarket();
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+        _fire(id, 0); // one failed attempt, two still booked
+        http.setResponse(200, bytes(ORACLE_JSON), "");
+    }
+
+    function _resolvedMarket() internal returns (uint256 id) {
+        id = _armedMarket();
+        _fire(id, 0);
+    }
+
+    function _invalidMarket() internal returns (uint256 id) {
+        id = _armedMarket();
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+        _fire(id, 0);
+        _fire(id, 1);
+        _fire(id, 2);
+        http.setResponse(200, bytes(ORACLE_JSON), "");
+    }
+
+    function _assertState(
+        uint256 id,
+        RitualPredict.MarketState expected,
+        string memory why
+    ) internal view {
+        assertEq(uint256(_state(id)), uint256(expected), why);
+    }
+
+    // ── valid paths, walked end to end ─────────────────────────────────
+
+    function test_Fsm_HappyPathOpenToClosedToResolved() public {
+        uint256 id = _create();
+        _assertState(id, RitualPredict.MarketState.Open, "fresh markets are Open");
+
+        vm.prank(alice);
+        predict.bet{value: 3 ether}(id, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Open,
+            "a bet does not move the state"
+        );
+
+        vm.roll(predict.getMarket(id).closeBlock);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Closed,
+            "the close block ends betting"
+        );
+
+        _rollToResolve(id);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Closed,
+            "still Closed until the Scheduler fires"
+        );
+
+        _fire(id, 0);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolved,
+            "a good read is final"
+        );
+    }
+
+    function test_Fsm_FailedReadParksInResolvingThenRecovers() public {
+        uint256 id = _armedMarket();
+
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+        _fire(id, 0);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolving,
+            "a failed read waits for a retry"
+        );
+        assertEq(predict.getMarket(id).attempts, 1);
+
+        _fire(id, 1);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolving,
+            "still waiting after the second"
+        );
+        assertEq(predict.getMarket(id).attempts, 2);
+
+        http.setResponse(200, bytes(ORACLE_JSON), "");
+        _fire(id, 2);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolved,
+            "the last attempt lands"
+        );
+    }
+
+    function test_Fsm_ThreeFailedReadsEndInInvalid() public {
+        uint256 id = _armedMarket();
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+
+        _fire(id, 0);
+        _fire(id, 1);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolving,
+            "two failures are not fatal"
+        );
+
+        _fire(id, 2);
+        _assertState(id, RitualPredict.MarketState.Invalid, "the third one is");
+
+        // A failed read is never taken as NO.
+        assertEq(
+            uint256(predict.getMarket(id).outcome),
+            uint256(RitualPredict.Outcome.Unresolved),
+            "an unread oracle leaves the outcome unresolved"
+        );
+    }
+
+    function test_Fsm_EmptyWinningSideJumpsStraightToInvalid() public {
+        uint256 id = _create();
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false); // nobody on YES, and YES will win
+        _rollToResolve(id);
+
+        _fire(id, 0);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Invalid,
+            "one attempt, straight to Invalid"
+        );
+        assertEq(
+            uint256(predict.getMarket(id).outcome),
+            uint256(RitualPredict.Outcome.Yes),
+            "the outcome is still recorded, the market is just unpayable"
+        );
+    }
+
+    // ── the invalid half of the table, state by state ──────────────────
+
+    function test_Fsm_OpenRejectsBothClaims() public {
+        uint256 id = _openMarket();
+
+        vm.expectRevert(RitualPredict.NotResolved.selector);
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        vm.expectRevert(RitualPredict.NotInvalid.selector);
+        vm.prank(alice);
+        predict.claimRefund(id);
+    }
+
+    function test_Fsm_ClosedRejectsEveryUserAction() public {
+        uint256 id = _closedMarket();
+        _assertState(id, RitualPredict.MarketState.Closed, "parked in Closed");
+
+        vm.expectRevert(RitualPredict.BettingClosed.selector);
+        vm.prank(carol);
+        predict.bet{value: 1 ether}(id, true);
+
+        vm.expectRevert(RitualPredict.NotResolved.selector);
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        vm.expectRevert(RitualPredict.NotInvalid.selector);
+        vm.prank(alice);
+        predict.claimRefund(id);
+    }
+
+    function test_Fsm_ResolvingRejectsEveryUserAction() public {
+        uint256 id = _resolvingMarket();
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolving,
+            "parked in Resolving"
+        );
+
+        vm.expectRevert(RitualPredict.BettingClosed.selector);
+        vm.prank(carol);
+        predict.bet{value: 1 ether}(id, true);
+
+        vm.expectRevert(RitualPredict.NotResolved.selector);
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        // The one that matters: money must not leave a market that can still resolve.
+        vm.expectRevert(RitualPredict.NotInvalid.selector);
+        vm.prank(alice);
+        predict.claimRefund(id);
+    }
+
+    function test_Fsm_ResolvedRejectsBetsAndRefunds() public {
+        uint256 id = _resolvedMarket();
+
+        vm.expectRevert(RitualPredict.BettingClosed.selector);
+        vm.prank(carol);
+        predict.bet{value: 1 ether}(id, true);
+
+        // A winner must not take the payout and then the stake back on top.
+        vm.expectRevert(RitualPredict.NotInvalid.selector);
+        vm.prank(alice);
+        predict.claimRefund(id);
+    }
+
+    function test_Fsm_InvalidRejectsBetsAndWinnings() public {
+        uint256 id = _invalidMarket();
+
+        vm.expectRevert(RitualPredict.BettingClosed.selector);
+        vm.prank(carol);
+        predict.bet{value: 1 ether}(id, true);
+
+        // No payout can be computed for a market that was never resolved.
+        vm.expectRevert(RitualPredict.NotResolved.selector);
+        vm.prank(alice);
+        predict.claimWinnings(id);
+    }
+
+    // ── terminal states really are terminal ────────────────────────────
+
+    /// The most important one: once everyone is entitled to a refund, a late oracle
+    /// recovery must not turn the market back into a payable one.
+    function test_Fsm_InvalidIsTerminalEvenWhenTheOracleRecovers() public {
+        uint256 id = _invalidMarket(); // the oracle is healthy again by now
+
+        _fire(id, 3); // a leftover booked execution arrives
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(
+            uint256(m.state),
+            uint256(RitualPredict.MarketState.Invalid),
+            "still Invalid"
+        );
+        assertEq(
+            m.attempts,
+            predict.MAX_ATTEMPTS(),
+            "the attempt counter did not move"
+        );
+        assertEq(
+            uint256(m.outcome),
+            uint256(RitualPredict.Outcome.Unresolved),
+            "no outcome was written after the fact"
+        );
+
+        // And the refund path still works afterwards.
+        vm.prank(alice);
+        predict.claimRefund(id);
+        assertEq(alice.balance, 100 ether, "alice got her stake back");
+    }
+
+    function test_Fsm_ResolvedIsTerminalEvenIfTheOracleChangesItsMind() public {
+        uint256 id = _resolvedMarket(); // YES, observed 4200
+
+        _setObserved(1); // the same URL would now answer NO
+        _fire(id, 1);
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(
+            uint256(m.state),
+            uint256(RitualPredict.MarketState.Resolved)
+        );
+        assertEq(
+            uint256(m.outcome),
+            uint256(RitualPredict.Outcome.Yes),
+            "the outcome is frozen"
+        );
+        assertEq(
+            m.observedValue,
+            OBSERVED,
+            "so is the value it was decided on"
+        );
+        assertEq(m.attempts, 1, "and no extra attempt was spent");
+    }
+
+    function test_Fsm_RefundIsAOneWayTransitionPerAccount() public {
+        uint256 id = _invalidMarket();
+
+        vm.prank(alice);
+        predict.claimRefund(id);
+
+        vm.expectRevert(RitualPredict.AlreadySettled.selector);
+        vm.prank(alice);
+        predict.claimRefund(id);
+
+        // Settling one account leaves every other account alone.
+        vm.prank(bob);
+        predict.claimRefund(id);
+        assertEq(address(predict).balance, 0);
+    }
+
+    function test_Fsm_SettlingIsPerAccountNotPerMarket() public {
+        uint256 id = _resolvedMarket(); // alice backed YES and won, bob backed NO
+
+        vm.prank(alice);
+        predict.claimWinnings(id);
+
+        vm.expectRevert(RitualPredict.NothingToClaim.selector);
+        vm.prank(bob);
+        predict.claimWinnings(id);
+
+        vm.expectRevert(RitualPredict.AlreadySettled.selector);
+        vm.prank(alice);
+        predict.claimWinnings(id);
+    }
+
+    // ── Closed is derived, not stored ──────────────────────────────────
+
+    /// `Closed` never reaches storage: `getMarket` synthesises it from the block number.
+    /// Rolling back before the close block therefore shows `Open` again, which a stored
+    /// state could never do. `bet` checks the block directly for exactly this reason, so
+    /// nothing depends on a state that is not really there.
+    function test_Fsm_ClosedIsDerivedFromTheBlockNotStored() public {
+        uint256 id = _openMarket();
+        uint64 closeBlock = predict.getMarket(id).closeBlock;
+
+        vm.roll(closeBlock);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Closed,
+            "at the close block: Closed"
+        );
+
+        vm.roll(closeBlock - 1);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Open,
+            "one block earlier it is Open again, so Closed was never written"
+        );
+
+        // getMarkets() goes through the same view, so the list agrees with the detail.
+        vm.roll(closeBlock);
+        RitualPredict.Market[] memory all = predict.getMarkets();
+        assertEq(
+            uint256(all[0].state),
+            uint256(RitualPredict.MarketState.Closed)
+        );
+    }
+
+    /// Resolution reads the stored state, which is still `Open` while the view reports
+    /// `Closed`. This pins that the derived state does not block the real transition.
+    function test_Fsm_ResolutionWorksFromTheDerivedClosedState() public {
+        uint256 id = _closedMarket();
+        _assertState(id, RitualPredict.MarketState.Closed, "the view says Closed");
+
+        _rollToResolve(id);
+        _fire(id, 0);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolved,
+            "and it still resolves"
+        );
+    }
 }
