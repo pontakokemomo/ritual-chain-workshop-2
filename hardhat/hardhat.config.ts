@@ -1,6 +1,16 @@
 import hardhatToolboxViemPlugin from "@nomicfoundation/hardhat-toolbox-viem";
 import { configVariable, defineConfig } from "hardhat/config";
 
+// Node 20+ reads a .env file with no extra dependency. A missing file is fine:
+// the values below fall back to real environment variables and public defaults.
+// (This call was present until commit 6e93b08 removed it, which left
+// .env.example's "loaded automatically by hardhat.config.ts" note inaccurate.)
+try {
+  process.loadEnvFile();
+} catch {
+  // no .env file
+}
+
 export default defineConfig({
   plugins: [hardhatToolboxViemPlugin],
   solidity: {
@@ -36,8 +46,8 @@ export default defineConfig({
       type: "http",
       chainType: "l1",
       chainId: 1979,
-      url: "https://rpc.ritualfoundation.org",
-      accounts: [configVariable("DEPLOYER_PRIVATE_KEY")],
+      url: process.env.RITUAL_RPC_URL ?? "https://rpc.ritualfoundation.org",
+      accounts: [configVariable("RITUAL_PRIVATE_KEY")],
     },
   },
 });
