@@ -1865,4 +1865,402 @@ contract RitualPredictTest is Test {
             "and it still resolves"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //                  INTERRUPTED AND RE-RUN EXECUTIONS
+    //
+    // Three different things can make this contract's code run more than
+    // once for what a user thinks of as a single operation:
+    //
+    //  1. The chain itself. A short-running async call is executed twice
+    //     by design: once as a simulation that builds the commitment (the
+    //     HTTP output is still empty) and once as a replay with the
+    //     settled output injected. The simulation's state is discarded.
+    //     Both passes must build a byte-identical request or the
+    //     settlement will not match the commitment.
+    //
+    //  2. An execution that dies half-way (out of gas). The EVM discards
+    //     everything it touched, so the market must be left exactly as it
+    //     was and the Scheduler's next booked attempt must still work.
+    //
+    //  3. A payee that calls back into the contract while it is being
+    //     paid. Native transfers forward all remaining gas, so a winner
+    //     that is a contract can re-enter `claimWinnings` or
+    //     `claimRefund` from inside its own payout.
+    //
+    // A fourth case is not re-execution but the same class of question:
+    // several markets are in flight at once, and settling one must not
+    // touch the others.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── 1. simulation, then replay ─────────────────────────────────────
+
+    /// The simulation pass cannot read a settled output, so it takes the failure path.
+    /// That must cost the market nothing, because the chain throws that state away and
+    /// replays the same execution from where it started.
+    function test_Rerun_TheSimulationPassIsDiscardedAndTheReplayDecides() public {
+        uint256 id = _armedMarket();
+        uint256 snap = vm.snapshotState();
+
+        // Pass 1: the builder simulates. actualOutput is still empty.
+        http.setMode(MockHttpPrecompile.Mode.Unsettled);
+        _fire(id, 0);
+        assertEq(
+            predict.getMarket(id).attempts,
+            1,
+            "inside the simulation the attempt does look spent"
+        );
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolving,
+            "and the market does look parked"
+        );
+
+        // The chain discards all of that and replays with the output injected.
+        vm.revertToState(snap);
+        http.setResponse(200, bytes(ORACLE_JSON), "");
+        _fire(id, 0);
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(m.attempts, 1, "only the replay is real, so one attempt was spent");
+        assertEq(
+            uint256(m.state),
+            uint256(RitualPredict.MarketState.Resolved),
+            "and the replay decides the market"
+        );
+        assertEq(m.observedValue, OBSERVED);
+    }
+
+    /// The commitment is built from the request bytes of the simulation and checked
+    /// again on the replay. The replay happens in a later block at a different basefee,
+    /// so nothing in the request may depend on either.
+    function test_Rerun_BothPassesBuildTheIdenticalRequest() public {
+        uint256 id = _armedMarket();
+        uint256 snap = vm.snapshotState();
+
+        http.setMode(MockHttpPrecompile.Mode.Unsettled);
+        _fire(id, 0);
+        address simExecutor = http.lastExecutor();
+        string memory simUrl = http.lastUrl();
+        uint256 simTtl = http.lastTtl();
+        uint8 simMethod = http.lastMethod();
+
+        vm.revertToState(snap);
+        vm.roll(block.number + 250); // the replay lands in a later block
+        vm.fee(9 gwei); // at a different basefee
+        http.setResponse(200, bytes(ORACLE_JSON), "");
+        _fire(id, 0);
+
+        assertEq(http.lastExecutor(), simExecutor, "the same executor in both passes");
+        assertEq(http.lastUrl(), simUrl, "the same url");
+        assertEq(http.lastTtl(), simTtl, "the same ttl");
+        assertEq(http.lastMethod(), simMethod, "the same method");
+    }
+
+    /// Each retry is a fresh simulate-and-replay pair, and the second one must not be
+    /// contaminated by the first.
+    function test_Rerun_EachRetryIsItsOwnSimulateAndReplayPair() public {
+        uint256 id = _armedMarket();
+
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+        _fire(id, 0); // attempt 1 genuinely fails
+        address firstExecutor = http.lastExecutor();
+
+        uint256 snap = vm.snapshotState();
+        http.setMode(MockHttpPrecompile.Mode.Unsettled);
+        _fire(id, 1); // attempt 2, simulation pass
+        address secondExecutor = http.lastExecutor();
+        assertTrue(
+            secondExecutor != firstExecutor,
+            "a retry re-rolls the executor, so one bad node cannot sink a market"
+        );
+
+        vm.revertToState(snap);
+        http.setResponse(200, bytes(ORACLE_JSON), "");
+        _fire(id, 1); // attempt 2, replay
+
+        assertEq(
+            http.lastExecutor(),
+            secondExecutor,
+            "the replay of attempt 2 reaches the same executor its simulation chose"
+        );
+        assertEq(predict.getMarket(id).attempts, 2, "one failure plus one success");
+        _assertState(id, RitualPredict.MarketState.Resolved, "and it resolves");
+    }
+
+    // ── 2. an execution that dies half-way ─────────────────────────────
+
+    function test_Rerun_AnExecutionThatRunsOutOfGasLeavesNoTrace() public {
+        uint256 id = _armedMarket();
+
+        bool finished = true;
+        try scheduler.fire{gas: 80_000}(_scheduleIdOf(id), 0) {} catch {
+            finished = false;
+        }
+        assertFalse(finished, "the execution was cut short");
+
+        RitualPredict.Market memory m = predict.getMarket(id);
+        assertEq(m.attempts, 0, "a half-finished execution burns no attempt");
+        assertEq(
+            uint256(m.state),
+            uint256(RitualPredict.MarketState.Closed),
+            "and leaves the market exactly as it was"
+        );
+        assertEq(m.totalYes, 3 ether, "the pools are untouched");
+        assertEq(m.totalNo, 1 ether);
+
+        // The next booked attempt still works, which is the whole point of not
+        // recording anything on the way in.
+        _fire(id, 1);
+        _assertState(
+            id,
+            RitualPredict.MarketState.Resolved,
+            "the Scheduler's next attempt resolves it"
+        );
+    }
+
+    // ── 3. a payee that calls back in ──────────────────────────────────
+
+    function test_Rerun_AReentrantWinnerCannotBePaidTwice() public {
+        uint256 id = _create();
+        ReentrantClaimer attacker = new ReentrantClaimer();
+        attacker.arm(predict, id, 0); // re-enter claimWinnings
+
+        attacker.bet{value: 3 ether}(true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        attacker.claim();
+
+        assertEq(attacker.reenterCount(), 1, "it did try to come back in");
+        assertTrue(attacker.nestedFailed(), "and the second claim was refused");
+        assertEq(address(attacker).balance, 4 ether, "exactly one payout, not two");
+        assertEq(address(predict).balance, 0, "nothing extra left the contract");
+    }
+
+    /// The cross-function version: take the payout, then try to take the stake back
+    /// through the refund path during the same transfer.
+    function test_Rerun_AWinnerCannotGrabARefundDuringItsOwnPayout() public {
+        uint256 id = _create();
+        ReentrantClaimer attacker = new ReentrantClaimer();
+        attacker.arm(predict, id, 1); // re-enter claimRefund
+
+        attacker.bet{value: 3 ether}(true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        attacker.claim();
+
+        assertTrue(attacker.nestedFailed(), "a resolved market has no refund path");
+        assertEq(address(attacker).balance, 4 ether, "the payout and nothing more");
+        assertEq(address(predict).balance, 0);
+    }
+
+    function test_Rerun_AReentrantRefundCannotBeTakenTwice() public {
+        uint256 id = _create();
+        ReentrantClaimer attacker = new ReentrantClaimer();
+        attacker.arm(predict, id, 1); // re-enter claimRefund
+
+        attacker.bet{value: 3 ether}(true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+        _rollToResolve(id);
+
+        http.setMode(MockHttpPrecompile.Mode.Fail);
+        _fire(id, 0);
+        _fire(id, 1);
+        _fire(id, 2); // three failures: everyone refunds
+
+        attacker.refund();
+
+        assertTrue(attacker.nestedFailed(), "the second refund was refused");
+        assertEq(address(attacker).balance, 3 ether, "its own stake, once");
+        assertEq(address(predict).balance, 1 ether, "bob's stake is still waiting");
+    }
+
+    /// A payout that cannot be delivered must not be recorded as settled, or the money
+    /// would be stranded. The claim reverts whole and can be made again later.
+    function test_Rerun_ARejectedPayoutCanBeClaimedAgainLater() public {
+        uint256 id = _create();
+        PickyReceiver picky = new PickyReceiver();
+        picky.arm(predict, id);
+
+        picky.bet{value: 3 ether}(true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(id, false);
+        _rollToResolve(id);
+        _fire(id, 0); // YES
+
+        picky.setAccepting(false);
+        vm.expectRevert(RitualPredict.TransferFailed.selector);
+        picky.claim();
+
+        (, , bool alreadySettled, uint256 claimable) = predict.stakesOf(
+            id,
+            address(picky)
+        );
+        assertFalse(alreadySettled, "a failed transfer settles nothing");
+        assertEq(claimable, 4 ether, "the payout is still owed");
+        assertEq(address(predict).balance, 4 ether, "and the money is still here");
+
+        picky.setAccepting(true);
+        picky.claim();
+        assertEq(address(picky).balance, 4 ether, "the retry goes through");
+        assertEq(address(predict).balance, 0);
+    }
+
+    // ── 4. several markets in flight at once ───────────────────────────
+
+    function test_Rerun_SettlingOneMarketLeavesTheOthersUntouched() public {
+        uint256 first = _openMarket();
+        uint256 second = _openMarket();
+        uint256 third = _openMarket();
+
+        _rollToResolve(second);
+        _fire(second, 0); // only the middle one
+
+        _assertState(second, RitualPredict.MarketState.Resolved, "the middle one settled");
+        _assertState(first, RitualPredict.MarketState.Closed, "the first is untouched");
+        _assertState(third, RitualPredict.MarketState.Closed, "so is the third");
+
+        RitualPredict.Market memory a = predict.getMarket(first);
+        assertEq(a.attempts, 0, "no attempt was spent on a market that did not fire");
+        assertEq(a.totalYes, 3 ether, "its pools are its own");
+        assertEq(a.totalNo, 1 ether);
+        assertEq(
+            uint256(a.outcome),
+            uint256(RitualPredict.Outcome.Unresolved),
+            "and it has no outcome yet"
+        );
+
+        // The third market can now settle the opposite way without disturbing the second.
+        _setObserved(1); // below the target, so NO
+        _fire(third, 0);
+
+        assertEq(
+            uint256(predict.getMarket(third).outcome),
+            uint256(RitualPredict.Outcome.No),
+            "the third resolves on its own reading"
+        );
+        RitualPredict.Market memory b = predict.getMarket(second);
+        assertEq(
+            uint256(b.outcome),
+            uint256(RitualPredict.Outcome.Yes),
+            "the second keeps the answer it was settled with"
+        );
+        assertEq(b.observedValue, OBSERVED, "and the value it was settled on");
+    }
+
+    function test_Rerun_ClaimingOnOneMarketLeavesTheOtherClaimable() public {
+        uint256 first = _openMarket();
+        uint256 second = _openMarket();
+
+        _rollToResolve(first);
+        _fire(first, 0);
+        _fire(second, 0);
+
+        vm.prank(alice);
+        predict.claimWinnings(first);
+
+        (, , bool settledFirst, ) = predict.stakesOf(first, alice);
+        (, , bool settledSecond, uint256 claimableSecond) = predict.stakesOf(
+            second,
+            alice
+        );
+        assertTrue(settledFirst, "the first market is settled for alice");
+        assertFalse(settledSecond, "the second is not");
+        assertEq(claimableSecond, 4 ether, "and is still fully claimable");
+
+        vm.prank(alice);
+        predict.claimWinnings(second);
+        // 3 ether staked on each of the two markets, 4 ether paid back from each.
+        assertEq(
+            alice.balance,
+            100 ether - 6 ether + 8 ether,
+            "both payouts arrived"
+        );
+    }
+}
+
+// ───────────────────────── test-only counterparties ──────────────────────────
+
+/// A bettor that calls back into the contract from inside its own payout. It swallows
+/// the nested failure, which is what a real attacker would do: blowing up its own
+/// transfer would only cost it the payout it already had.
+contract ReentrantClaimer {
+    RitualPredict public predict;
+    uint256 public marketId;
+    uint8 public mode; // 0 = re-enter claimWinnings, 1 = re-enter claimRefund
+    uint256 public reenterCount;
+    bool public nestedFailed;
+    bool private _inside;
+
+    function arm(RitualPredict p, uint256 id, uint8 m) external {
+        predict = p;
+        marketId = id;
+        mode = m;
+    }
+
+    function bet(bool isYes) external payable {
+        predict.bet{value: msg.value}(marketId, isYes);
+    }
+
+    function claim() external {
+        predict.claimWinnings(marketId);
+    }
+
+    function refund() external {
+        predict.claimRefund(marketId);
+    }
+
+    receive() external payable {
+        if (_inside) return;
+        _inside = true;
+        reenterCount += 1;
+
+        if (mode == 0) {
+            try predict.claimWinnings(marketId) {} catch {
+                nestedFailed = true;
+            }
+        } else {
+            try predict.claimRefund(marketId) {} catch {
+                nestedFailed = true;
+            }
+        }
+
+        _inside = false;
+    }
+}
+
+/// A bettor that refuses payment until it is switched on, so a payout can be made to
+/// fail and then retried.
+contract PickyReceiver {
+    RitualPredict public predict;
+    uint256 public marketId;
+    bool public accepting;
+
+    function arm(RitualPredict p, uint256 id) external {
+        predict = p;
+        marketId = id;
+    }
+
+    function setAccepting(bool v) external {
+        accepting = v;
+    }
+
+    function bet(bool isYes) external payable {
+        predict.bet{value: msg.value}(marketId, isYes);
+    }
+
+    function claim() external {
+        predict.claimWinnings(marketId);
+    }
+
+    receive() external payable {
+        require(accepting, "not accepting right now");
+    }
 }
