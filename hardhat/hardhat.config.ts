@@ -40,8 +40,10 @@ export default defineConfig({
       type: "edr-simulated",
       chainType: "l1",
     },
-    // A real node started with `npx hardhat node`. The end-to-end tests can be
-    // pointed at it with:  E2E_NETWORK=localhost npx hardhat test nodejs
+    // A real node started with `npx hardhat node`. The end-to-end tests are pointed
+    // at it through the E2E_NETWORK environment variable, which is set per shell:
+    //   bash        E2E_NETWORK=localhost npx hardhat test nodejs
+    //   PowerShell  $env:E2E_NETWORK="localhost"; npx hardhat test nodejs
     localhost: {
       type: "http",
       chainType: "l1",

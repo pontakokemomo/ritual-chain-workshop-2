@@ -59,11 +59,21 @@ goes through the ABI exactly as a frontend would see it. A market runs from crea
 being paid; an unreachable oracle exhausts its three attempts and everyone is refunded; and the
 whole market list is read back the way a UI would render it.
 
-These run on Hardhat's in-process EVM by default. To run them against a real local node instead:
+These run on Hardhat's in-process EVM by default. To run them against a real local node
+instead, start the node in one terminal and point the tests at it from another. `E2E_NETWORK`
+is an environment variable, so the second command differs by shell:
 
 ```bash
-npx hardhat node                                # in one terminal
-E2E_NETWORK=localhost npx hardhat test nodejs   # in another
+npx hardhat node                                        # terminal 1
+
+E2E_NETWORK=localhost npx hardhat test nodejs           # terminal 2, bash / zsh
+```
+
+```powershell
+npx hardhat node                                        # terminal 1
+
+$env:E2E_NETWORK="localhost"; npx hardhat test nodejs   # terminal 2, PowerShell
+Remove-Item Env:E2E_NETWORK                             # unset it, or later runs stay on localhost
 ```
 
 **The output of every one of those runs is recorded in

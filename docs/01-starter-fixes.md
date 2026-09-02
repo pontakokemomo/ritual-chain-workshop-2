@@ -87,11 +87,15 @@ committed. These are the gaps this fork sets out to fill:
 The README's own counts were stale as well (they described files that were never
 committed), so they now state what the suite actually contains.
 
-Two loose ends are deliberately left alone. The `web/` frontend is out of scope for
-the workshop deliverable. And `npx tsc --noEmit` reports `TS5097` on the seven
-upstream `scripts/*.ts` imports: Hardhat 3 runs TypeScript through Node's type
-stripping, which requires the `.ts` extension in import paths, but `tsconfig.json`
-does not set `allowImportingTsExtensions`. The contracts and tests typecheck clean.
+One loose end is deliberately left alone: the `web/` frontend is out of scope for the
+workshop deliverable.
+
+A second one was fixed. `npx tsc --noEmit` reported `TS5097` on the seven upstream
+`scripts/*.ts` imports, because Hardhat 3 runs TypeScript through Node's type stripping,
+which requires the `.ts` extension in import paths, and `tsconfig.json` did not set
+`allowImportingTsExtensions`. It does now, together with `noEmit` (which that option
+requires, and which is simply true here: nothing in this project is compiled to
+JavaScript). The typecheck is clean.
 
 `contracts/RitualPredict.sol` also carries five unimplemented bodies marked
 `// we'll fill this up`, at lines 208, 240, 380, 423 and 432:

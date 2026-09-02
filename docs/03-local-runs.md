@@ -257,9 +257,21 @@ The end-to-end tests run on Hardhat's in-process EVM by default. They can also b
 pointed at an actual node over JSON-RPC, which exercises the same contract through a
 real network round trip rather than an in-memory one.
 
+`E2E_NETWORK` is an environment variable, so the second command differs by shell. Both
+were run; the output below is from the PowerShell one, on the Windows machine this was
+developed on.
+
 ```bash
-npx hardhat node                                # terminal 1
-E2E_NETWORK=localhost npx hardhat test nodejs   # terminal 2
+npx hardhat node                                        # terminal 1
+
+E2E_NETWORK=localhost npx hardhat test nodejs           # terminal 2, bash / zsh
+```
+
+```powershell
+npx hardhat node                                        # terminal 1
+
+$env:E2E_NETWORK="localhost"; npx hardhat test nodejs   # terminal 2, PowerShell
+Remove-Item Env:E2E_NETWORK                             # unset it, or later runs stay on localhost
 ```
 
 ```

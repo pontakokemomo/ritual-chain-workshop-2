@@ -12,9 +12,15 @@
  * is modified, mocked out, or told it is being tested. It calls 0x0801, 0x0803, the
  * Scheduler and the TEEServiceRegistry by their real addresses.
  *
- *   npx hardhat test nodejs                        # Hardhat's in-process EVM
- *   npx hardhat node                               # in one terminal, then:
- *   E2E_NETWORK=localhost npx hardhat test nodejs  # against a real local node
+ * By default they run on Hardhat's in-process EVM:
+ *
+ *   npx hardhat test nodejs
+ *
+ * Setting E2E_NETWORK points them at a network from hardhat.config.ts instead. To use a
+ * real local node, run `npx hardhat node` in one terminal, then in another:
+ *
+ *   bash        E2E_NETWORK=localhost npx hardhat test nodejs
+ *   PowerShell  $env:E2E_NETWORK="localhost"; npx hardhat test nodejs
  */
 
 import assert from "node:assert/strict";
