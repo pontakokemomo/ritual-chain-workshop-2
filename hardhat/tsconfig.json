@@ -4,7 +4,11 @@
     "module": "node20",
     "target": "es2023",
     "skipLibCheck": true,
-    "outDir": "dist",
+    // Hardhat 3 runs TypeScript through Node's type stripping, which needs the
+    // ".ts" extension in import paths. `allowImportingTsExtensions` requires
+    // `noEmit`, which is right here: nothing in this project is compiled to JS.
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "types": ["node"],
     "verbatimModuleSyntax": true
   }

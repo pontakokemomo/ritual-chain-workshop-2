@@ -65,3 +65,8 @@ These run on Hardhat's in-process EVM by default. To run them against a real loc
 npx hardhat node                                # in one terminal
 E2E_NETWORK=localhost npx hardhat test nodejs   # in another
 ```
+
+**The output of every one of those runs is recorded in
+[../docs/03-local-runs.md](../docs/03-local-runs.md)**, pasted unedited: all 135 test names, the
+gas table, and the run against a real local node. Ritual Chain was down for this workshop, so that
+file is the evidence in place of a deployment.

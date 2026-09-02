@@ -11,6 +11,25 @@ Winners then pull their proportional share of the pool.
 
 ---
 
+## Where to look
+
+Ritual Chain was down while this was built, so there is no deployment and no transaction
+hash. All verification is local, and it is written down rather than described:
+
+| | |
+| --- | --- |
+| [`docs/03-local-runs.md`](docs/03-local-runs.md) | **Every local run, with its real output pasted unedited**: 135 passing tests with all their names, the measured gas table, and the end-to-end suite run against a real `npx hardhat node` |
+| [`docs/01-starter-fixes.md`](docs/01-starter-fixes.md) | What the starter repo was missing or broken, and what was done about it |
+| [`hardhat/contracts/RitualPredict.sol`](hardhat/contracts/RitualPredict.sol) | The contract. The five workshop function bodies are `createMarket`, `onScheduledResolve`, `_readOracle`, `_pickExecutor` and `_scheduleResolution` |
+| [`hardhat/contracts/RitualPredict.t.sol`](hardhat/contracts/RitualPredict.t.sol) | 132 Solidity unit tests |
+| [`hardhat/test/RitualPredict.e2e.ts`](hardhat/test/RitualPredict.e2e.ts) | 3 TypeScript end-to-end tests |
+
+```bash
+cd hardhat && npm install && npx hardhat test    # 135 passing, no network needed
+```
+
+---
+
 ## Architecture
 
 ```
